@@ -1,0 +1,6 @@
+[submodule "lib/RansacLib"]
+	path = lib/RansacLib
+	url = https://github.com/tsattler/RansacLib.git
+[submodule "lib/re3q3"]
+	path = lib/re3q3
+	url = https://github.com/vlarsson/re3q3/

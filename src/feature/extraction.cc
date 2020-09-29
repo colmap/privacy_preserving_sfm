@@ -1,0 +1,532 @@
+// Copyright (c) 2020, ETH Zurich and UNC Chapel Hill.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//     * Redistributions of source code must retain the above copyright
+//       notice, this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+//     * Neither the name of ETH Zurich and UNC Chapel Hill nor the names of
+//       its contributors may be used to endorse or promote products derived
+//       from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+//
+// Authors: Johannes L. Schoenberger (jsch-at-demuc-dot-de)
+//          Viktor Larsson (viktor.larsson@inf.ethz.ch)
+//          Marcel Geppert (marcel.geppert@inf.ethz.ch)
+
+#include "feature/extraction.h"
+
+#include <numeric>
+#include <set>
+
+#include "SiftGPU/SiftGPU.h"
+#include "feature/sift.h"
+#include "util/cuda.h"
+#include "util/misc.h"
+#include "util/random.h"
+#include "utils.h"
+
+namespace colmap {
+namespace {
+
+void ScaleKeypoints(const Bitmap& bitmap, const Camera& camera,
+                    FeatureKeypoints* keypoints) {
+  if (static_cast<size_t>(bitmap.Width()) != camera.Width() ||
+      static_cast<size_t>(bitmap.Height()) != camera.Height()) {
+    const float scale_x = static_cast<float>(camera.Width()) / bitmap.Width();
+    const float scale_y = static_cast<float>(camera.Height()) / bitmap.Height();
+    for (auto& keypoint : *keypoints) {
+      keypoint.Rescale(scale_x, scale_y);
+    }
+  }
+}
+
+void MaskKeypoints(const Bitmap& mask, FeatureKeypoints* keypoints,
+                   FeatureDescriptors* descriptors) {
+  size_t out_index = 0;
+  BitmapColor<uint8_t> color;
+  for (size_t i = 0; i < keypoints->size(); ++i) {
+    if (!mask.GetPixel(static_cast<int>(keypoints->at(i).x),
+                       static_cast<int>(keypoints->at(i).y), &color) ||
+        color.r == 0) {
+      // Delete this keypoint by not copying it to the output.
+    } else {
+      // Retain this keypoint by copying it to the output index (in case this
+      // index differs from its current position).
+      if (out_index != i) {
+        keypoints->at(out_index) = keypoints->at(i);
+        for (int col = 0; col < descriptors->cols(); ++col) {
+          (*descriptors)(out_index, col) = (*descriptors)(i, col);
+        }
+      }
+      out_index += 1;
+    }
+  }
+
+  keypoints->resize(out_index);
+  descriptors->conservativeResize(out_index, descriptors->cols());
+}
+
+}  // namespace
+
+SiftFeatureExtractor::SiftFeatureExtractor(
+    const ImageReaderOptions& reader_options,
+    const SiftExtractionOptions& sift_options)
+    : reader_options_(reader_options),
+      sift_options_(sift_options),
+      database_(reader_options_.database_path, true),
+      image_reader_(reader_options_, &database_) {
+  CHECK(reader_options_.Check());
+  CHECK(sift_options_.Check());
+
+  std::shared_ptr<Bitmap> camera_mask;
+  if (!reader_options_.camera_mask_path.empty()) {
+    camera_mask = std::shared_ptr<Bitmap>(new Bitmap());
+    if (!camera_mask->Read(reader_options_.camera_mask_path,
+                           /*as_rgb*/ false)) {
+      std::cerr << "  ERROR: Cannot read camera mask file: "
+                << reader_options_.camera_mask_path
+                << ". No mask is going to be used." << std::endl;
+      camera_mask.reset();
+    }
+  }
+
+  const int num_threads = GetEffectiveNumThreads(sift_options_.num_threads);
+  CHECK_GT(num_threads, 0);
+
+  // Make sure that we only have limited number of objects in the queue to avoid
+  // excess in memory usage since images and features take lots of memory.
+  const int kQueueSize = 1;
+  resizer_queue_.reset(new JobQueue<internal::ImageData>(kQueueSize));
+  extractor_queue_.reset(new JobQueue<internal::ImageData>(kQueueSize));
+  writer_queue_.reset(new JobQueue<internal::ImageData>(kQueueSize));
+
+  if (sift_options_.max_image_size > 0) {
+    for (int i = 0; i < num_threads; ++i) {
+      resizers_.emplace_back(new internal::ImageResizerThread(
+          sift_options_.max_image_size, resizer_queue_.get(),
+          extractor_queue_.get()));
+    }
+  }
+
+  if (!sift_options_.domain_size_pooling &&
+      !sift_options_.estimate_affine_shape && sift_options_.use_gpu) {
+    std::vector<int> gpu_indices = CSVToVector<int>(sift_options_.gpu_index);
+    CHECK_GT(gpu_indices.size(), 0);
+
+#ifdef CUDA_ENABLED
+    if (gpu_indices.size() == 1 && gpu_indices[0] == -1) {
+      const int num_cuda_devices = GetNumCudaDevices();
+      CHECK_GT(num_cuda_devices, 0);
+      gpu_indices.resize(num_cuda_devices);
+      std::iota(gpu_indices.begin(), gpu_indices.end(), 0);
+    }
+#endif  // CUDA_ENABLED
+
+    auto sift_gpu_options = sift_options_;
+    for (const auto& gpu_index : gpu_indices) {
+      sift_gpu_options.gpu_index = std::to_string(gpu_index);
+      extractors_.emplace_back(new internal::SiftFeatureExtractorThread(
+          sift_gpu_options, camera_mask, extractor_queue_.get(),
+          writer_queue_.get()));
+    }
+  } else {
+    auto custom_sift_options = sift_options_;
+    custom_sift_options.use_gpu = false;
+    for (int i = 0; i < num_threads; ++i) {
+      extractors_.emplace_back(new internal::SiftFeatureExtractorThread(
+          custom_sift_options, camera_mask, extractor_queue_.get(),
+          writer_queue_.get()));
+    }
+  }
+
+  // TODO Make aligned line ratio a parameter
+  writer_.reset(new internal::LineFeatureWriterThread(
+      0.5, image_reader_.NumImages(), &database_, writer_queue_.get()));
+}
+
+void SiftFeatureExtractor::Run() {
+  PrintHeading1("Feature extraction");
+
+  for (auto& resizer : resizers_) {
+    resizer->Start();
+  }
+
+  for (auto& extractor : extractors_) {
+    extractor->Start();
+  }
+
+  writer_->Start();
+
+  for (auto& extractor : extractors_) {
+    if (!extractor->CheckValidSetup()) {
+      return;
+    }
+  }
+
+  while (image_reader_.NextIndex() < image_reader_.NumImages()) {
+    if (IsStopped()) {
+      resizer_queue_->Stop();
+      extractor_queue_->Stop();
+      resizer_queue_->Clear();
+      extractor_queue_->Clear();
+      break;
+    }
+
+    internal::ImageData image_data;
+    image_data.status =
+        image_reader_.Next(&image_data.camera, &image_data.image,
+                           &image_data.bitmap, &image_data.mask);
+
+    if (image_data.status != ImageReader::Status::SUCCESS) {
+      image_data.bitmap.Deallocate();
+    }
+
+    if (sift_options_.max_image_size > 0) {
+      CHECK(resizer_queue_->Push(image_data));
+    } else {
+      CHECK(extractor_queue_->Push(image_data));
+    }
+  }
+
+  resizer_queue_->Wait();
+  resizer_queue_->Stop();
+  for (auto& resizer : resizers_) {
+    resizer->Wait();
+  }
+
+  extractor_queue_->Wait();
+  extractor_queue_->Stop();
+  for (auto& extractor : extractors_) {
+    extractor->Wait();
+  }
+
+  writer_queue_->Wait();
+  writer_queue_->Stop();
+  writer_->Wait();
+
+  GetTimer().PrintMinutes();
+}
+
+namespace internal {
+
+ImageResizerThread::ImageResizerThread(const int max_image_size,
+                                       JobQueue<ImageData>* input_queue,
+                                       JobQueue<ImageData>* output_queue)
+    : max_image_size_(max_image_size),
+      input_queue_(input_queue),
+      output_queue_(output_queue) {}
+
+void ImageResizerThread::Run() {
+  while (true) {
+    if (IsStopped()) {
+      break;
+    }
+
+    const auto input_job = input_queue_->Pop();
+    if (input_job.IsValid()) {
+      auto image_data = input_job.Data();
+
+      if (image_data.status == ImageReader::Status::SUCCESS) {
+        if (static_cast<int>(image_data.bitmap.Width()) > max_image_size_ ||
+            static_cast<int>(image_data.bitmap.Height()) > max_image_size_) {
+          // Fit the down-sampled version exactly into the max dimensions.
+          const double scale =
+              static_cast<double>(max_image_size_) /
+              std::max(image_data.bitmap.Width(), image_data.bitmap.Height());
+          const int new_width =
+              static_cast<int>(image_data.bitmap.Width() * scale);
+          const int new_height =
+              static_cast<int>(image_data.bitmap.Height() * scale);
+
+          image_data.bitmap.Rescale(new_width, new_height);
+        }
+      }
+
+      output_queue_->Push(image_data);
+    } else {
+      break;
+    }
+  }
+}
+
+SiftFeatureExtractorThread::SiftFeatureExtractorThread(
+    const SiftExtractionOptions& sift_options,
+    const std::shared_ptr<Bitmap>& camera_mask,
+    JobQueue<ImageData>* input_queue, JobQueue<ImageData>* output_queue)
+    : sift_options_(sift_options),
+      camera_mask_(camera_mask),
+      input_queue_(input_queue),
+      output_queue_(output_queue) {
+  CHECK(sift_options_.Check());
+
+#ifndef CUDA_ENABLED
+  if (sift_options_.use_gpu) {
+    opengl_context_.reset(new OpenGLContextManager());
+  }
+#endif
+}
+
+void SiftFeatureExtractorThread::Run() {
+  std::unique_ptr<SiftGPU> sift_gpu;
+  if (sift_options_.use_gpu) {
+#ifndef CUDA_ENABLED
+    CHECK(opengl_context_);
+    opengl_context_->MakeCurrent();
+#endif
+
+    sift_gpu.reset(new SiftGPU);
+    if (!CreateSiftGPUExtractor(sift_options_, sift_gpu.get())) {
+      std::cerr << "ERROR: SiftGPU not fully supported." << std::endl;
+      SignalInvalidSetup();
+      return;
+    }
+  }
+
+  SignalValidSetup();
+
+  while (true) {
+    if (IsStopped()) {
+      break;
+    }
+
+    const auto input_job = input_queue_->Pop();
+    if (input_job.IsValid()) {
+      auto image_data = input_job.Data();
+
+      if (image_data.status == ImageReader::Status::SUCCESS) {
+        bool success = false;
+        if (sift_options_.estimate_affine_shape ||
+            sift_options_.domain_size_pooling) {
+          success = ExtractCovariantSiftFeaturesCPU(
+              sift_options_, image_data.bitmap, &image_data.keypoints,
+              &image_data.descriptors);
+        } else if (sift_options_.use_gpu) {
+          success = ExtractSiftFeaturesGPU(
+              sift_options_, image_data.bitmap, sift_gpu.get(),
+              &image_data.keypoints, &image_data.descriptors);
+        } else {
+          success = ExtractSiftFeaturesCPU(sift_options_, image_data.bitmap,
+                                           &image_data.keypoints,
+                                           &image_data.descriptors);
+        }
+        if (success) {
+          ScaleKeypoints(image_data.bitmap, image_data.camera,
+                         &image_data.keypoints);
+          if (camera_mask_) {
+            MaskKeypoints(*camera_mask_, &image_data.keypoints,
+                          &image_data.descriptors);
+          }
+          if (image_data.mask.Data()) {
+            MaskKeypoints(image_data.mask, &image_data.keypoints,
+                          &image_data.descriptors);
+          }
+        } else {
+          image_data.status = ImageReader::Status::FAILURE;
+        }
+      }
+
+      image_data.bitmap.Deallocate();
+
+      output_queue_->Push(image_data);
+    } else {
+      break;
+    }
+  }
+}
+
+LineFeatureWriterThread::LineFeatureWriterThread(const double aligned_line_ratio,
+                                                 const size_t num_images,
+                                                 Database* database,
+                                                 JobQueue<ImageData>* input_queue)
+    : aligned_line_ratio_(aligned_line_ratio), num_images_(num_images), database_(database), input_queue_(input_queue) {
+  // TODO: Remove this?
+  SetPRNGSeed(std::chrono::system_clock::now().time_since_epoch().count());
+}
+
+void LineFeatureWriterThread::Run() {
+  size_t image_index = 0;
+  while (true) {
+    if (IsStopped()) {
+      break;
+    }
+
+    auto input_job = input_queue_->Pop();
+    if (input_job.IsValid()) {
+      auto& image_data = input_job.Data();
+
+      image_index += 1;
+
+      std::cout << StringPrintf("Processed file [%d/%d]", image_index,
+                                num_images_)
+                << std::endl;
+
+      std::cout << StringPrintf("  Name:            %s",
+                                image_data.image.Name().c_str())
+                << std::endl;
+
+      if (image_data.status == ImageReader::Status::IMAGE_EXISTS) {
+        std::cout << "  SKIP: Features for image already extracted."
+                  << std::endl;
+      } else if (image_data.status == ImageReader::Status::BITMAP_ERROR) {
+        std::cout << "  ERROR: Failed to read image file format." << std::endl;
+      } else if (image_data.status ==
+                 ImageReader::Status::CAMERA_SINGLE_DIM_ERROR) {
+        std::cout << "  ERROR: Single camera specified, "
+                     "but images have different dimensions."
+                  << std::endl;
+      } else if (image_data.status ==
+                 ImageReader::Status::CAMERA_EXIST_DIM_ERROR) {
+        std::cout << "  ERROR: Image previously processed, but current image "
+                     "has different dimensions."
+                  << std::endl;
+      } else if (image_data.status == ImageReader::Status::CAMERA_PARAM_ERROR) {
+        std::cout << "  ERROR: Camera has invalid parameters." << std::endl;
+      } else if (image_data.status == ImageReader::Status::FAILURE) {
+        std::cout << "  ERROR: Failed to extract features." << std::endl;
+      }
+
+      if (image_data.status != ImageReader::Status::SUCCESS) {
+        continue;
+      }
+
+      std::cout << StringPrintf("  Dimensions:      %d x %d",
+                                image_data.camera.Width(),
+                                image_data.camera.Height())
+                << std::endl;
+      std::cout << StringPrintf("  Camera:          #%d - %s",
+                                image_data.camera.CameraId(),
+                                image_data.camera.ModelName().c_str())
+                << std::endl;
+      std::cout << StringPrintf("  Focal Length:    %.2fpx",
+                                image_data.camera.MeanFocalLength());
+      if (image_data.camera.HasPriorFocalLength()) {
+        std::cout << " (Prior)" << std::endl;
+      } else {
+        std::cout << std::endl;
+      }
+      if (image_data.image.HasTvecPrior()) {
+        std::cout << StringPrintf(
+            "  GPS:             LAT=%.3f, LON=%.3f, ALT=%.3f",
+            image_data.image.TvecPrior(0),
+            image_data.image.TvecPrior(1),
+            image_data.image.TvecPrior(2))
+                  << std::endl;
+      }
+      std::cout << StringPrintf("  Features:        %d",
+                                image_data.keypoints.size())
+                << std::endl;
+
+      if (!database_->ExistsLineFeatures(image_data.image.ImageId())) {
+        // Generate line features
+        Image& image = image_data.image;
+
+        const std::vector<Eigen::Vector2d> points =
+            FeatureKeypointsToPointsVector(image_data.keypoints);
+
+        const int num_features = points.size();
+        const double num_features_double = static_cast<double>(num_features);
+        const int max_feature_idx = num_features-1;
+
+        // Make sure the lines are initialized
+        if (image.NumLines() == 0) {
+          image.SetLines(FeatureLines(num_features));
+        }
+
+        // Randomly select features to be aligned
+        std::set<int> aligned_feature_idxs;
+        while (static_cast<double>(aligned_feature_idxs.size())
+               / num_features_double < aligned_line_ratio_) {
+          aligned_feature_idxs.emplace(RandomInteger(0, max_feature_idx));
+        }
+
+        std::cout << "Aligning " << aligned_feature_idxs.size()
+                  << " out of " << num_features << " lines\n";
+
+        // GO over all features and create the respective lines
+        const Camera& camera = database_->ReadCamera(image.CameraId());
+
+        const Eigen::Vector3d& gravity_dir =
+            image.HasGravity() ? image.GravityDirection() : Eigen::Vector3d::Zero();
+
+        if (!image.HasGravity()) {
+          std::cout << "Warning - No gravity available for image "
+                    << image.ImageId() << " (" << image.Name() << "). "
+                    << "Only assigning random line features."
+                    << std::endl;
+        }
+
+        for (int feature_idx = 0; feature_idx < num_features; ++ feature_idx) {
+          const Eigen::Vector2d point2D = points.at(feature_idx);
+          const Eigen::Vector2d normalized_point2D =
+              camera.ImageToWorld(point2D);
+
+          FeatureLine& feature_line = image.Line(feature_idx);
+
+          if (image.HasGravity() && aligned_feature_idxs.count(feature_idx) > 0) {
+            // Line should be gravity-aligned
+            const Eigen::Vector3d line_dir =
+                gravity_dir.cross(normalized_point2D.homogeneous());
+
+            feature_line = FeatureLine{line_dir, true, kInvalidPoint3DId};
+          } else {
+            // Assign a random orientation
+
+            const Eigen::Vector3d random_dir = Eigen::Vector3d::Random();
+            const Eigen::Vector3d line_dir =
+                random_dir.cross(normalized_point2D.homogeneous());
+
+            feature_line = FeatureLine{line_dir, false, kInvalidPoint3DId};
+          }
+
+          // Normalizing the first two components to 1 makes the distance
+          // computation during SfM simpler.
+          const double head_norm = image.Line(feature_idx).Line().head<2>().norm();
+
+          feature_line.SetLine(feature_line.Line() / head_norm);
+        }
+      }
+
+      DatabaseTransaction database_transaction(database_);
+
+      if (image_data.image.ImageId() == kInvalidImageId) {
+        image_data.image.SetImageId(database_->WriteImage(image_data.image));
+      }
+
+      if (!database_->ExistsDescriptors(image_data.image.ImageId())) {
+        database_->WriteDescriptors(image_data.image.ImageId(),
+                                    image_data.descriptors);
+      }
+
+      if(!database_->ExistsLineFeatures(image_data.image.ImageId())) {
+        database_->WriteFeatureLines(image_data.image.ImageId(), image_data.image.Lines());
+      }
+
+      if (image_data.image.HasGravity() && !database_->ExistsImageGravity(image_data.image.ImageId())) {
+        database_->WriteImageGravity(image_data.image.ImageId(), image_data.image.GravityDirection());
+      }
+    } else {
+      break;
+    }
+  }
+}
+
+}  // namespace internal
+}  // namespace colmap
