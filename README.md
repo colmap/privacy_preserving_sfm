@@ -1,7 +1,7 @@
 # Privacy Preserving Structure-from-Motion
 
 This is the COLMAP version for the [Privacy Preserving SfM project](http://www.cvg.ethz.ch/research/privacy-preserving-sfm).
-The code is heavily based on standard [COLMAP](www.github.com/colmap/colmap),
+The code is heavily based on standard [COLMAP](https://www.github.com/colmap/colmap),
 but we removed a lot of code (likely we missed something) that is not directly
 necessary for the privacy preserving pipeline to reduce the complexity and make
 the code easier to understand.
