@@ -6,6 +6,11 @@ but we removed a lot of code (likely we missed something) that is not directly
 necessary for the privacy preserving pipeline to reduce the complexity and make
 the code easier to understand.
 
+### Update
+
+We are currently cleaning up the code of the new version that works without known camera calibrations ([CVPR 2021](https://mgprt.com/publication/pp_loc_map/)).
+It will be released here soon.
+
 ### About
 
 In this project we explore privacy preserving methods for SfM by replacing the
@@ -34,7 +39,7 @@ If you are using this code in a scientific project please cite
 }
 ```
 
-Please not that this is not the exact same code that we used to create the results in our paper.
+Please note that this is not the exact same code that we used to create the results in our paper.
 
 ### Running the pipeline
 
